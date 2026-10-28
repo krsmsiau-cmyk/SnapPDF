@@ -5,7 +5,7 @@ export function createScanner({onCapture,onError}) {
   const status=document.querySelector('#scanStatus'), meter=document.querySelector('#scanProgress');
   const thumb=document.querySelector('#scanThumb'), count=document.querySelector('#scanCount');
   const probe=document.createElement('canvas'), pctx=probe.getContext('2d',{willReadFrequently:true});
-  let stream=null, running=false, raf=0, lastTick=0, stable=0, prior=null, candidate=null, armed=true, lost=0, shots=[], processing=false;
+  let stream=null, running=false, raf=0, lastTick=0, stable=0, prior=null, candidate=null, armed=true, lost=0, shots=[], processing=false, fallbackPrior=null, fallbackStable=0, scanStarted=0, fallbackCaptured=false;
   const W=320;
   function message(t){status.textContent=t}
   function polygon(g,w,h){const fit=Math.min(w/video.videoWidth,h/video.videoHeight),iw=video.videoWidth*fit,ih=video.videoHeight*fit,ox=(w-iw)/2,oy=(h-ih)/2;ctx.lineWidth=4;ctx.strokeStyle=stable>=9?'#4df0b1':'#41cbd4';ctx.fillStyle='rgba(42,222,204,.11)';ctx.beginPath();g.forEach((p,i)=>i?ctx.lineTo(ox+p[0]*iw,oy+p[1]*ih):ctx.moveTo(ox+p[0]*iw,oy+p[1]*ih));ctx.closePath();ctx.fill();ctx.stroke();for(const [x,y] of g){ctx.fillStyle='#fff';ctx.beginPath();ctx.arc(ox+x*iw,oy+y*ih,5,0,Math.PI*2);ctx.fill()}}
@@ -47,14 +47,58 @@ export function createScanner({onCapture,onError}) {
     }
     return best?.corners||null;
   }
+  // Secondary mode for printed/color documents whose white region is fragmented.
+  // Track image movement rather than requiring one connected white component.
+  function fallbackCheck(){
+    const w=80, h=Math.max(60,Math.round(w*video.videoHeight/video.videoWidth));
+    probe.width=w;probe.height=h;pctx.drawImage(video,0,0,w,h);
+    const raw=pctx.getImageData(0,0,w,h).data, samples=[];
+    let brightness=0, texture=0, last=0;
+    for(let y=Math.floor(h*.16);y<h*.84;y+=3)for(let x=Math.floor(w*.12);x<w*.88;x+=3){
+      const i=(y*w+x)*4, v=(raw[i]*3+raw[i+1]*6+raw[i+2])/10;
+      samples.push(v);brightness+=v;texture+=Math.abs(v-last);last=v;
+    }
+    const avg=brightness/Math.max(1,samples.length), detail=texture/Math.max(1,samples.length);
+    if(avg<45 || detail<4){fallbackPrior=samples;fallbackStable=0;return false}
+    if(fallbackPrior&&fallbackPrior.length===samples.length){
+      let movement=0;for(let i=0;i<samples.length;i++)movement+=Math.abs(samples[i]-fallbackPrior[i]);
+      movement/=samples.length;
+      fallbackStable=movement<5.5?Math.min(24,fallbackStable+1):Math.max(0,fallbackStable-3);
+    }
+    fallbackPrior=samples;
+    return true;
+  }
+  function guide(){
+    // Fallback crops the central area; its outline is deliberately amber, not a detected edge.
+    const vw=video.videoWidth,vh=video.videoHeight;
+    const side=.065, top=.065;
+    const g=[[side,top],[1-side,top],[1-side,1-top],[side,1-top]];
+    const fit=Math.min(overlay.width/vw,overlay.height/vh),iw=vw*fit,ih=vh*fit,ox=(overlay.width-iw)/2,oy=(overlay.height-ih)/2;
+    ctx.setLineDash([16,10]);ctx.strokeStyle='#ffd36a';ctx.lineWidth=4;ctx.beginPath();
+    g.forEach((p,i)=>i?ctx.lineTo(ox+p[0]*iw,oy+p[1]*ih):ctx.moveTo(ox+p[0]*iw,oy+p[1]*ih));
+    ctx.closePath();ctx.stroke();ctx.setLineDash([]);return g;
+  }
   function jitter(a,b){if(!a||!b)return Infinity;return a.reduce((s,p,i)=>s+Math.hypot(p[0]-b[i][0],p[1]-b[i][1]),0)/4}
   function step(t){if(!running)return;raf=requestAnimationFrame(step);if(t-lastTick<105)return;lastTick=t;
     overlay.width=video.clientWidth*devicePixelRatio;overlay.height=video.clientHeight*devicePixelRatio;
     const g=detect();candidate=g;
-    if(g){lost=0;polygon(g,overlay.width,overlay.height);stable=jitter(g,prior)<.018?Math.min(14,stable+1):Math.max(0,stable-3);prior=g;
+    if(g){fallbackStable=0;fallbackPrior=null;lost=0;polygon(g,overlay.width,overlay.height);stable=jitter(g,prior)<.018?Math.min(14,stable+1):Math.max(0,stable-3);prior=g;
       if(armed){meter.style.width=Math.min(100,stable/11*100)+'%';message(stable>=9?'已鎖定 A4 紙張，正在拍照…':'偵測到紙張，請保持手機穩定');if(stable>=11&&!processing)capture(true)}
       else{message('已拍攝！移開紙張再放下一張，或點「再次掃描」');meter.style.width='100%'}
-    }else{stable=0;prior=null;lost++;if(!armed&&lost>=7){armed=true;meter.style.width='0%'}if(armed){message('請將完整 A4 紙張放入畫面，避免背景太亮');meter.style.width='0%'}}
+    }else{
+      stable=0;prior=null;lost++;
+      if(!armed&&!fallbackCaptured&&lost>=7){armed=true;meter.style.width='0%';fallbackStable=0}
+      if(armed){
+        const valid=fallbackCheck();
+        // Allow the contour detector to run first; then use a motion-locked guide.
+        if(t-scanStarted>2100){
+          candidate=guide();
+          meter.style.width=(valid?Math.min(100,fallbackStable/15*100):0)+'%';
+          message(valid?'備援自動掃描：請將整張紙對齊黃色框並保持不動':'請將紙張放入黃色框，並增加照明');
+          if(valid&&fallbackStable>=15&&!processing)capture(true);
+        }else{message('正在尋找紙張邊緣…');meter.style.width='0%'}
+      }
+    }
   }
   // Warp quadrilateral to a rectangular page via homography (bilinear pixel interpolation).
   function rectify(corners){
@@ -71,15 +115,15 @@ export function createScanner({onCapture,onError}) {
     for(let y=0;y<oh;y++){let v=y/(oh-1);for(let x=0;x<ow;x++){let u=x/(ow-1),den=b[6]*u+b[7]*v+1,sx=(b[0]*u+b[1]*v+b[2])/den,sy=(b[3]*u+b[4]*v+b[5])/den,ix=Math.max(0,Math.min(sw-1,Math.round(sx))),iy=Math.max(0,Math.min(sh-1,Math.round(sy))),si=(iy*sw+ix)*4,di=(y*ow+x)*4;outD[di]=srcD[si];outD[di+1]=srcD[si+1];outD[di+2]=srcD[si+2];outD[di+3]=255}}
     dst.putImageData(outImg,0,0);return out;
   }
-  async function capture(auto=false){if(processing||!running||(!armed&&auto))return;processing=true;armed=false;try{
+  async function capture(auto=false){if(processing||!running||(!armed&&auto))return;processing=true;armed=false;fallbackCaptured=!!(candidate&&fallbackStable>=15);try{
     const canvas=rectify(candidate);const blob=await new Promise(r=>canvas.toBlob(r,'image/jpeg',.88));if(!blob)throw Error('無法產生圖片');shots.push(blob);
     const url=URL.createObjectURL(blob);if(thumb.dataset.url)URL.revokeObjectURL(thumb.dataset.url);thumb.dataset.url=url;thumb.src=url;thumb.hidden=false;count.textContent=`已掃描 ${shots.length} 頁`;
-    navigator.vibrate?.(90);onCapture?.(blob,shots.length);message(auto?'已自動拍照！移開紙張掃描下一頁':'已拍照！移開紙張掃描下一頁');
+    navigator.vibrate?.(90);onCapture?.(blob,shots.length);message(auto?'已自動拍照！移開紙張掃描下一頁':'已拍照！移開紙張掃描下一頁');fallbackStable=0;fallbackPrior=null;
   }catch(e){armed=true;onError?.(e)}finally{stable=0;processing=false}}
-  async function start(){if(running)return;root.classList.remove('hidden');shots=[];armed=true;stable=0;lost=0;prior=null;thumb.hidden=true;count.textContent='已掃描 0 頁';meter.style.width='0%';message('正在啟動相機…');try{
+  async function start(){if(running)return;root.classList.remove('hidden');shots=[];armed=true;stable=0;lost=0;prior=null;fallbackStable=0;fallbackPrior=null;fallbackCaptured=false;scanStarted=performance.now();thumb.hidden=true;count.textContent='已掃描 0 頁';meter.style.width='0%';message('正在啟動相機…');try{
     if(!navigator.mediaDevices?.getUserMedia)throw Error('請使用 HTTPS 網址或 localhost 開啟，才能使用即時相機');
     stream=await navigator.mediaDevices.getUserMedia({audio:false,video:{facingMode:{ideal:'environment'},width:{ideal:1920},height:{ideal:1080}}});video.srcObject=stream;await video.play();running=true;raf=requestAnimationFrame(step);
   }catch(e){stop();onError?.(e);message('無法啟動相機：'+e.message)}}
   function stop(){running=false;cancelAnimationFrame(raf);if(stream)stream.getTracks().forEach(x=>x.stop());stream=null;video.pause();video.srcObject=null;root.classList.add('hidden')}
-  return {start,stop,capture:()=>capture(false),rearm(){armed=true;stable=0;prior=null;meter.style.width='0%';message('請保持紙張完整入鏡')},getShots:()=>shots.slice(),isRunning:()=>running};
+  return {start,stop,capture:()=>capture(false),rearm(){armed=true;stable=0;prior=null;fallbackStable=0;fallbackPrior=null;fallbackCaptured=false;scanStarted=performance.now();meter.style.width='0%';message('請保持紙張完整入鏡')},getShots:()=>shots.slice(),isRunning:()=>running};
 }
