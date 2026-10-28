@@ -1,0 +1,1 @@
+{"name":"SnapPDF Lite - PDF Tools","short_name":"SnapPDF Lite","description":"在裝置上處理 PDF 的 PWA","start_url":"./","scope":"./","display":"standalone","background_color":"#101313","theme_color":"#171d1d","icons":[{"src":"icon-192.png","sizes":"192x192","type":"image/png","purpose":"any maskable"},{"src":"icon-512.png","sizes":"512x512","type":"image/png","purpose":"any maskable"}]}
